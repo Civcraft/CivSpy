@@ -1,0 +1,10 @@
+database:
+ host:
+ port:
+ database:
+ user:
+ password:
+aggregate_period: 60000
+period_delay_count: 6
+period_future_count: 3
+server: local
