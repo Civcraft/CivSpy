@@ -12,6 +12,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.LinkedList;
+import java.util.Iterator;
 
 /**
  * Represents a self-monitoring manager that accepts data into a queue and asynchronously pulls data
@@ -50,6 +52,7 @@ public class DataManager {
 	 * A fixed size threadpool of greedy queue consumers that read off the data queue.
 	 */
 	private final ExecutorService dequeueWorkers;
+	private LinkedList<RepeatingQueueMinder> actualWorkers;
 	
 	private int roughWorkerCount = 0; // actual
 	/**
@@ -149,7 +152,10 @@ public class DataManager {
 	 * concurrently) or alter your sampling/event tracking rates to ease congestion.
 	 */
 	private long missCounter = 0l;
-
+	private long missCounterNegativeOffset = 0l;
+	private long missCounterOffloadIndex = 0l;
+	private long missCounterOutsideTracking = 0l;
+	private long missCounterWrongWindow = 0l;
 
 	/**
 	 * Sets up a data manager; defining who to forward aggregate and sampled data to, a logger to log to, and aggregation
@@ -206,7 +212,8 @@ public class DataManager {
 		this.offloadAggregatorIndex = 0;
 
 		// We backdate our windows.
-		long window = System.currentTimeMillis() - (this.aggregationPeriod * this.periodDelayCount);
+		long rightnow = System.currentTimeMillis();
+		long window = rightnow - (this.aggregationPeriod * this.periodDelayCount);
 		for (int idx = 1; idx <= this.aggregationCycleSize; idx++) {
 			int odx = idx % aggregationCycleSize;
 			this.aggregation[odx] = new ConcurrentHashMap<DataSampleKey, DataAggregate>();
@@ -215,6 +222,9 @@ public class DataManager {
 			this.aggregationWindowEnd[odx] = window;
 			logger.log(Level.INFO, "Aggregator window {0} bounds: {1} to {2}", 
 					new Object[] {odx, aggregationWindowStart[odx], aggregationWindowEnd[odx]} );
+			if (rightnow < window && rightnow >= window - this.aggregationPeriod) {
+				logger.log(Level.INFO, "NOW points at window {0}", odx);
+			}
 		}
 
 		// Now create the executor and schedule repeating tasks.
@@ -223,6 +233,7 @@ public class DataManager {
 		this.workerCount = workerCount;
 		
 		this.dequeueWorkers = Executors.newFixedThreadPool(this.workerCount);
+		this.actualWorkers = new LinkedList<RepeatingQueueMinder>();
 
 		// First, the queue reading task.
 		for (int i = 0; i < this.workerCount; i++) {
@@ -308,18 +319,38 @@ public class DataManager {
 				}
 				lastFlowUpdate = System.currentTimeMillis();
 				
-				if (flowRatio > flowRatioSevere) {
-					// TODO add mechanism to only alert once.
+				if (flowRatio > flowRatioSevere && whichFlowWindow % 3 == 0) {
 					logger.log(Level.SEVERE, "Inflow vs. Outflow DANGEROUSLY imbalanced: in vs out ratio at {0}", flowRatio);
 					logger.log(Level.SEVERE, "Action should be taken immediately or memory exhaustion may occur");
-				} else if (flowRatio > flowRatioWarn) {
+				} else if (flowRatio > flowRatioWarn && whichFlowWindow % 5 == 0) {
 					logger.log(Level.WARNING, "Inflow vs. Outflow imbalanced: in vs out ratio at {0}", flowRatio);
 				}
 				
 				// Periodically report.
 				if (whichFlowWindow == 0) {
-					logger.log(Level.INFO, "Over last {0} milliseconds, absolute inflow = {1} and outflow = {2}, missed aggregations now at = {3}",
-							new Object[] { (flowCapturePeriod * (flowCaptureWindows - 1)), inFlow, outFlow, missCounter});
+					logger.log(Level.INFO, "Over last {0} milliseconds, absolute inflow = {1} and outflow = {2}, missed aggregations now at = {3}. \n Missed due to negative offset: {4}, offload index collision: {5}, outside tracking windows: {6}, window mismatch: {7}",
+							new Object[] { (flowCapturePeriod * (flowCaptureWindows - 1)), inFlow, outFlow, missCounter,
+							missCounterNegativeOffset,
+							missCounterOffloadIndex,
+							missCounterOutsideTracking,
+							missCounterWrongWindow});
+					StringBuilder flowReport = new StringBuilder();
+					flowReport.append(roughWorkerCount).append(" dequeue workers active. Per dequeue averages: ");
+					Iterator<RepeatingQueueMinder> rqms = actualWorkers.iterator();
+					double avgsum = 0.0;
+					double avgcnt = 0.0;
+					while (rqms.hasNext()) {
+						RepeatingQueueMinder rqm = rqms.next();
+						if (rqm.nanoTimeCumulativeAvg < 0.0) {
+							rqms.remove();
+						} else {
+							avgsum += rqm.nanoTimeCumulativeAvg;
+							avgcnt ++;
+							flowReport.append(rqm.nanoTimeCumulativeAvg).append("ns, ");
+						}
+					}
+					flowReport.append("\n overall avg: ").append( (avgsum / avgcnt) ).append("ns.");
+					logger.log(Level.INFO, flowReport.toString());
 				}
 				
 				if (truePeriod > (flowCapturePeriod * 1.1d)) {
@@ -337,7 +368,9 @@ public class DataManager {
 	}
 	
 	private void newWorker() {
-		this.dequeueWorkers.execute(new RepeatingQueueMinder(this.dequeueWorkers, this));
+		RepeatingQueueMinder rqm = new RepeatingQueueMinder(this.dequeueWorkers, this);
+		this.dequeueWorkers.execute(rqm);
+		this.actualWorkers.add(rqm);
 	}
 	
 	private void scheduleWindowCycle() {
@@ -363,9 +396,12 @@ public class DataManager {
 				}
 				
 				synchronized(aggregation[offloadAggregatorIndex]) {
+					long shiftTime = System.currentTimeMillis();
+					long count = 0l;
 					ConcurrentHashMap<DataSampleKey, DataAggregate> aggregationMap = aggregation[offloadAggregatorIndex];
 					for(Entry<DataSampleKey, DataAggregate> entry : aggregationMap.entrySet()) {
 						batcher.stage(entry.getKey(), entry.getValue());
+						count++;
 					}
 					aggregationMap.clear();
 					
@@ -373,8 +409,16 @@ public class DataManager {
 					aggregationWindowStart[offloadAggregatorIndex] += aggregationCycleSize * aggregationPeriod;
 					aggregationWindowEnd[offloadAggregatorIndex] += aggregationCycleSize * aggregationPeriod;
 					
-					logger.log(Level.FINE, "Aggregator window {0} bounds: {1} to {2}", 
-							new Object[] {offloadAggregatorIndex, aggregationWindowStart[offloadAggregatorIndex], aggregationWindowEnd[offloadAggregatorIndex]} );
+					logger.log(Level.INFO, "Aggregator window {0} bounds: {1} to {2} offloading {3} in {4}ms", 
+							new Object[] {offloadAggregatorIndex, aggregationWindowStart[offloadAggregatorIndex], 
+							aggregationWindowEnd[offloadAggregatorIndex], count, (System.currentTimeMillis() - shiftTime)} );
+					
+					int offset = (int) Math.floorDiv((shiftTime - aggregationWindowStart[oldestAggregatorIndex]), aggregationPeriod);
+					int index = Math.floorMod(oldestAggregatorIndex + offset, aggregationCycleSize); // Round Robin around and around
+
+					logger.log(Level.INFO, "NOW points to window {0} via oldest {1} + offset {2} mod {3}", 
+							new Object[] {index, oldestAggregatorIndex, offset, aggregationCycleSize});
+
 				}
 			}
 			
@@ -428,11 +472,15 @@ public class DataManager {
 	static class RepeatingQueueMinder implements Runnable {
 		private final WeakReference<ExecutorService> scheduler;
 		private final WeakReference<DataManager> parent;
+		private long executions;
+		public double nanoTimeCumulativeAvg;
 
 		RepeatingQueueMinder(ExecutorService scheduler, DataManager parent) {
 			this.scheduler = new WeakReference<ExecutorService>(scheduler);
 			this.parent = new WeakReference<DataManager>(parent);
 			parent.roughWorkerCount++;
+			executions = 0l;
+			nanoTimeCumulativeAvg = 0.0;
 		}
 
 		public void run() {
@@ -440,9 +488,10 @@ public class DataManager {
 			DataManager parent = this.parent.get();
 			if (parent == null) {
 				System.out.println("No logger, no parent, this RepeatingQueueMinder is saying goodnight sweet prince");
+				nanoTimeCumulativeAvg = -1.0;
 				return;
 			}
-			
+
 			// Wait for a new sample.
 			DataSample sample = null;
 			try {
@@ -452,8 +501,9 @@ public class DataManager {
 			}
 
 			try {
+				long nanoNow = System.nanoTime();
+				parent.instantOutflow[parent.whichFlowWindow]++;
 				if (sample != null) {
-					parent.instantOutflow[parent.whichFlowWindow]++;
 					if (sample.forAggregate()) {
 						// Find which bucket the sample belongs to; get the appropriate aggregate or create it
 						int index = -1; // must resolve.
@@ -462,15 +512,20 @@ public class DataManager {
 						// the windows while we are resolving.
 						synchronized(parent.aggregationResolver) {
 							int offset = (int) Math.floorDiv((sample.getTimestamp() - parent.aggregationWindowStart[parent.oldestAggregatorIndex]), parent.aggregationPeriod);
-							if (offset < 0 || offset >= parent.aggregationCycleSize || offset == parent.offloadAggregatorIndex) {
+							if (offset < 0) {
 								// out of tracking period entirely.
 								parent.missCounter++;
+								parent.missCounterNegativeOffset++;
+							} else if  (offset >= parent.aggregationCycleSize){
+								parent.missCounter++;
+								parent.missCounterOutsideTracking++;
 							} else {
 								index = Math.floorMod(parent.oldestAggregatorIndex + offset, parent.aggregationCycleSize); // Round Robin around and around
 								if (!sample.isBetween(parent.aggregationWindowStart[index], parent.aggregationWindowEnd[index])) {
 									parent.logger.log(Level.WARNING, "Computed window offset {4} to index {0} doesnt match when attempting to get aggregator: {1} not between {2} and {3}",
 											new Object[]{index, sample.getTimestamp(), parent.aggregationWindowStart[index], parent.aggregationWindowEnd[index], offset});
 									parent.missCounter++;
+									parent.missCounterWrongWindow++;
 									index = -1;
 								}
 							}
@@ -492,6 +547,8 @@ public class DataManager {
 									aggregate.include(sample);
 								} else {
 									parent.missCounter++;
+									// TODO: Differentiate here to detect if misses are from pre-seek or post
+									parent.missCounterOffloadIndex++;
 								}
 							}
 						}
@@ -503,6 +560,11 @@ public class DataManager {
 						parent.batcher.stage(sample.getKey(), simple);
 					}
 				}
+
+				executions++;
+				long nanoDiff = System.nanoTime() - nanoNow;
+				nanoTimeCumulativeAvg += ((nanoDiff - nanoTimeCumulativeAvg) / (double) executions);
+			
 			} catch (NullPointerException npe) {
 				parent.logger.log(Level.SEVERE, "Null pointer while aggregating sample", npe);
 			} catch (IndexOutOfBoundsException ioobe) {
@@ -519,10 +581,12 @@ public class DataManager {
 					parent.logger.log(Level.WARNING, "Unable to reschedule {0} minder.", this.toString());
 					parent.logger.log(Level.WARNING, "Failure based on this exception:", ree);
 					parent.roughWorkerCount--;
+					nanoTimeCumulativeAvg = -1.0;
 				}
 			} else {
 				parent.logger.log(Level.INFO, "Gracefully not rescheduling {0} as scheduler has been finalized.", this.toString());
 				parent.roughWorkerCount--;
+				nanoTimeCumulativeAvg = -1.0;
 			}
 		}
 	}
